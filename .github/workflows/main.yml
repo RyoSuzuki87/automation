@@ -1,0 +1,87 @@
+name: Build Android after Apply
+
+on:
+  # 「Issueからファイル適用」系のWFが完了したら起動
+  workflow_run:
+    workflows:
+      - Apply Files (Issue Opened)   # ← ワークフロー名に合わせて増減OK
+    types: [completed]
+
+permissions:
+  contents: read
+
+# Flutterプロジェクトが repo/automation 配下にある想定
+defaults:
+  run:
+    working-directory: automation
+
+jobs:
+  build-android:
+    # Apply系WFが success のときだけ実行
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout at patched commit
+        uses: actions/checkout@v4
+        with:
+          # Apply系WFが更新したコミットSHA
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.8'   # あなたの環境に合わせて
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+
+      # 生成物の存在チェック（デバッグ用）
+      - name: Verify APK path
+        run: |
+          set -e
+          pwd
+          ls -al build/app/outputs/flutter-apk
+          test -f build/app/outputs/flutter-apk/app-release.apk
+
+      # ▼ rclone を apt で入れる（最短・安定）
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          rclone version
+          rclone --version
+
+      # ▼ rclone の設定を Secrets から配置（remote 名はあなたの conf に合わせる）
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf "%s" "${RCLONE_CONF}" > ~/.config/rclone/rclone.conf
+          rclone listremotes || true
+
+      # ▼ コピー実行（working-directory=automation なので APK_PATH は build/ から）
+      - name: Upload APK via rclone
+        env:
+          DEST_DIR: ${{ secrets.DRIVE_DEST_DIR }}   # 例: FlutterBuilds
+          GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          APK_PATH: build/app/outputs/flutter-apk/app-release.apk
+        run: |
+          set -e
+          DATE=$(date +'%Y%m%d-%H%M%S')
+          SHORT_SHA=${GIT_SHA::7}
+          DEST_FILE="app-release-${DATE}-${SHORT_SHA}.apk"
+
+          # 例: Dropbox に上げるなら "dropbox:"、Google Drive なら "gdrive:"
+          rclone copy "$APK_PATH" "dropbox:${DEST_DIR:-FlutterBuilds}/${DEST_FILE}" -P

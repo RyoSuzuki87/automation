@@ -1,0 +1,118 @@
+name: Apply Files (Issue Opened)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write   # ← 追加：Issue を閉じる/コメントするため
+
+jobs:
+  apply-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Issue本文から ```files ... ``` を抽出して $RUNNER_TEMP/files.spec に保存
+      - name: Extract files block (Python, robust)
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, sys, json
+          with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as f:
+              ev = json.load(f)
+          body = (ev.get('issue',{}) or {}).get('body','') or ''
+          m = re.search(r"```files\s*\n(.*?)\n```", body, flags=re.S)
+          content = m.group(1) if m else None
+          if not content and body.lstrip().startswith('--- '):
+              content = body.strip()
+          if not content:
+              print("::error::No ```files block found and body doesn't start with '--- '", file=sys.stderr)
+              sys.exit(1)
+          out = os.path.join(os.environ['RUNNER_TEMP'], 'files.spec')
+          with open(out, 'w', encoding='utf-8', newline='\n') as f:
+              f.write(content)
+          PY
+          echo "spec=$RUNNER_TEMP/files.spec" >> "$GITHUB_OUTPUT"
+
+      # files.spec をパースしてワークスペースへ書き出し（nonlocal 不使用）
+      - name: Apply files to workspace
+        id: apply
+        if: ${{ steps.extract.outputs.spec != '' }}
+        env:
+          SPEC: ${{ steps.extract.outputs.spec }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys, json
+          spec = os.environ['SPEC']
+          with open(spec, encoding='utf-8') as f:
+              lines = f.read().splitlines()
+
+          files_written = []
+          path = None
+          buf = []
+
+          def flush_current(p, b):
+              if p is None:
+                  return None, []
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              with open(p, 'w', encoding='utf-8', newline='\n') as w:
+                  w.write('\n'.join(b) + ('\n' if b else ''))
+              files_written.append(p)
+              return None, []
+
+          for line in lines:
+              if line.startswith('--- '):
+                  path, buf = flush_current(path, buf)
+                  path = line[4:].strip()
+              else:
+                  buf.append(line)
+          path, buf = flush_current(path, buf)
+
+          print("Wrote files:", ", ".join(files_written))
+          if not files_written:
+              print("::error::No files were created/updated")
+              sys.exit(1)
+
+          # outputs 用
+          out = os.environ.get('GITHUB_OUTPUT')
+          if out:
+              with open(out, 'a', encoding='utf-8') as gho:
+                  gho.write(f"files={json.dumps(files_written)}\n")
+          PY
+
+      - name: Commit and push
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "chatgpt-bot"
+          git config user.email "chatgpt-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "Apply files from issue #${{ github.event.issue.number }}"
+          git push origin HEAD:main   # ← ブランチ名に合わせて変更
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      # 適用後に Issue を自動でクローズ
+      - name: Close issue
+        if: ${{ success() }}   # ワークフロー成功時にクローズ
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.issue.number }} \
+            -d '{"state":"closed"}'
